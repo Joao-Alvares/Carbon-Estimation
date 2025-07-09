@@ -1,0 +1,382 @@
+# Initialization
+!pip install -q geopandas geemap earthengine-api seaborn matplotlib --upgrade
+
+import geemap, ee
+import seaborn as sns
+import matplotlib.pyplot as plt
+import json
+from datetime import datetime
+import pandas as pd
+import geopandas as gpd
+
+import ipywidgets as widgets
+from IPython.display import display
+
+try:
+    ee.Initialize()
+except Exception as e:
+    ee.Authenticate()
+    ee.Initialize(project='alvares-carbon-project')
+
+ROI = ee.Geometry.Polygon([[[-47.57583, -1.103708], [-47.566955, -1.10445], [-47.567404, -1.111342], [-47.56886, -1.111173],
+                            [-47.569007, -1.11221], [-47.571081, -1.111995], [-47.57096, -1.111047], [-47.576612, -1.110396]]])
+
+ROI_C = ee.Geometry.Polygon([[[-47.568665, -1.109994], [-47.56777, -1.110076], [-47.567867, -1.11098], [-47.568755, -1.11089]]])
+ROI_M = ee.Geometry.Polygon([[[-47.570294, -1.109887], [-47.5694, -1.109943], [-47.569503, -1.110848], [-47.570402, -1.110774]]])
+ROI_R = ee.Geometry.Polygon([[[-47.569154, -1.107642], [-47.568331, -1.108027], [-47.568726, -1.10883], [-47.569553, -1.108427]]])
+
+ROI_Buffer = ee.Geometry.Point(-47.572302, -1.1080860).buffer(3000)
+
+SCALE_M_PX = 10
+
+#------------------------------------------------------------------------------#
+# Years of measurement
+# 2018 | 2020 | 2022
+#------------------------------------------------------------------------------#
+
+startDate = ee.Date('2018-01-01')
+endDate = ee.Date('2018-12-31')
+
+dates = ee.List.sequence(
+    start=startDate.millis(),
+    end=endDate.millis(),
+    step=16 * 24 * 60 * 60 * 1000 
+).map(lambda millis: ee.Date(millis).format("YYYY-MM-dd"))
+
+#------------------------------------------------------------------------------#
+# Functions
+#------------------------------------------------------------------------------#
+
+# Land Surface Temperature
+def Calculation_LST(dateString):
+    Calculation_LST = (ee.ImageCollection("MODIS/061/MOD11A2")
+        .filterBounds(ROI)
+        .filterDate(ee.Date(dateString), ee.Date(dateString).advance(16, "day"))
+        .select('LST_Day_1km')
+        .mean()
+        .rename("LST")
+        .multiply(0.02)
+        .subtract(273.15)
+        .reproject(crs='EPSG:4326', scale=SCALE_M_PX)
+        .clip(ROI_Buffer)
+        .set("date", dateString))
+
+    return Calculation_LST
+
+# Surface Solar Radiation
+def Calculation_SOL(dateString):
+    Calculation_SOL = (ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+        .filterBounds(ROI_Buffer)
+        .filterDate(ee.Date(dateString), ee.Date(dateString).advance(16, "day"))
+        .select('surface_solar_radiation_downwards_sum')
+        .sum()
+        .rename("SOL")
+        .divide(1e6)
+        .reproject(crs='EPSG:4326', scale=SCALE_M_PX)
+        .clip(ROI_Buffer)
+        .set("date", dateString))
+
+    return Calculation_SOL
+
+# Water Stress
+def Calculation_We(dateString):
+    imageSum16days = (ee.ImageCollection("MODIS/061/MOD16A2GF")
+        .filterDate(ee.Date(dateString), ee.Date(dateString).advance(16, "day"))
+        .filterBounds(ROI_Buffer)
+        .sum())
+
+    ET = imageSum16days.select('ET').multiply(0.1)
+    PET = imageSum16days.select('PET').multiply(0.1)
+    We = ET.divide(PET).multiply(1).add(0.5)
+
+    return (We.rename('We')
+            .reproject('EPSG:4326', None, SCALE_M_PX)
+            .clip(ROI_Buffer)
+            .set("data", dateString))
+
+# Function to calculate average NDVI every 16 days
+def Calculation_16_NDVI(dateString):
+
+    NDVI_Scenes = (ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
+        .filterBounds(ROI_Buffer)
+        .filterDate(ee.Date(dateString), ee.Date(dateString).advance(16, "day")))
+
+    # Calculate the NDVI for each image in the collection
+    def NDVI_Formula(image):
+        NDVI_F= image.normalizedDifference(['B8', 'B4']).rename('NDVI_F')
+        return image.addBands(NDVI_F)  # Adds the NDVI band to the image
+
+    # Applies the NDVI function to each image in the collection
+    NDVI_Scenes = NDVI_Scenes.map(NDVI_Formula)
+    # Average NDVI over a 16-day period
+    NDVI_M = NDVI_Scenes.select('NDVI_F').mean()
+    NDVI_M = (NDVI_M
+        .reproject(crs='EPSG:4326', scale=SCALE_M_PX)
+        .clip(ROI_Buffer)
+        .set("date", dateString))
+
+    return NDVI_M
+
+#------------------------------------------------------------------------------#
+# Collections
+#------------------------------------------------------------------------------#
+
+NDVI_16_Collection = ee.ImageCollection(dates.map(Calculation_16_NDVI))
+LST_Collection = ee.ImageCollection(dates.map(Calculation_LST))
+SOL_Collection = ee.ImageCollection(dates.map(Calculation_SOL))
+We_Collection = ee.ImageCollection(dates.map(Calculation_We))
+
+#------------------------------------------------------------------------------#
+# Creating singles
+#------------------------------------------------------------------------------#
+
+LST_Single = LST_Collection.first()
+SOL_Single = SOL_Collection.first()
+We_Single = We_Collection.first()
+
+#------------------------------------------------------------------------------#
+# NPP
+#------------------------------------------------------------------------------#
+# Ideal temperature for plant growth
+Topt = 25
+# Maximum light usage efficiency
+LUEmax = 0.706
+
+# Function
+def NPP_Single_16(NDVI_16_Collection, LST_Single, SOL_Single, We_Single, Topt, LUEmax):
+
+    Calculation_1 = ee.Image().expression(
+        '0.8 + 0.02 * Topt - 0.0005 * (Topt ** 2)',
+        {'Topt': Topt})
+
+    Calculation_2 = ee.Image().expression(
+        '1 / (1 + exp(0.2 * (Topt - 10 - T))) * 1 / (1 + exp(0.3 * (-Topt - 10 + T)))',
+        {'Topt': Topt, 'T': LST_Single})
+
+    Calculation_PAR = SOL_Single.multiply(0.5)
+    Calculation_FPAR = NDVI_16_Collection.multiply(1.2).subtract(0.14)
+    Calculation_APAR = Calculation_PAR.multiply(Calculation_FPAR)
+
+    Calculation_LUE = ee.Image().expression(
+        'LUEmax * Calculation_1 * Calculation_2 * Calculation_We',
+        {'LUEmax': LUEmax, 'Calculation_1': Calculation_1, 'Calculation_2': Calculation_2, 'Calculation_We': We_Single})
+
+    return Calculation_APAR.multiply(Calculation_LUE).rename('Band_NPP_C')
+
+#------------------------------------------------------------------------------#
+# NPP Collection
+#------------------------------------------------------------------------------#
+
+# Take the single and apply it to a Collection
+
+def NPP_Collection(NDVI_16_Collection, LST_Collection, SOL_Collection, We_Collection, Topt, LUEmax):
+
+    size = NDVI_16_Collection.size()
+
+    # Converts Collections to lists in iteration order
+    IC_List_NDVI = NDVI_16_Collection.toList(NDVI_16_Collection.size())
+    IC_List_LST = LST_Collection.toList(LST_Collection.size())
+    IC_List_SOL = SOL_Collection.toList(SOL_Collection.size())
+    IC_List_We = We_Collection.toList(We_Collection.size())
+
+    # Iterates through the collections from 0 to size-1
+    Sequence_Range = ee.List.sequence(0, size.subtract(1))
+
+    def Mapping_Function(i):
+       # Get NDVI, LST, SOL at index i
+        NDVI = ee.Image(IC_List_NDVI.get(i))
+        LST = ee.Image(IC_List_LST.get(i))
+        SOL = ee.Image(IC_List_SOL.get(i))
+        We = ee.Image(IC_List_We.get(i))
+
+        # Compute single NPP
+        NPP = NPP_Single_16(NDVI, LST, SOL, We, Topt, LUEmax)
+
+        return NPP.set("system:index", ee.String(i))
+
+    # Apply the map function
+    Results_NPP = Sequence_Range.map(Mapping_Function)
+
+    # Since a list has been iterated through, now cast to an ImageCollection
+    NPP_Collection = ee.ImageCollection(Results_NPP)
+
+    # Return NPP ImageCollection
+    return NPP_Collection
+
+# Improving nomenclature
+NPP_Collection_Result = NPP_Collection(NDVI_16_Collection, LST_Collection, SOL_Collection, We_Collection, Topt, LUEmax)
+
+#------------------------------------------------------------------------------#
+# NPP for scene
+#------------------------------------------------------------------------------#
+
+def Calculation_NPP_Scene_C(img):
+    NPP_Scene = img.reduceRegion(reducer=ee.Reducer.sum(), geometry=ROI_C, scale=10, maxPixels=1e13)
+    NPP_value = ee.Number(NPP_Scene.get('Band_NPP_C', 0))
+    return img.set('NPP_sum', NPP_value)
+
+def Calculation_NPP_Scene_M(img):
+    NPP_Scene = img.reduceRegion(reducer=ee.Reducer.sum(), geometry=ROI_M, scale=10, maxPixels=1e13)
+    NPP_value = ee.Number(NPP_Scene.get('Band_NPP_C', 0))
+    return img.set('NPP_sum', NPP_value)
+
+def Calculation_NPP_Scene_R(img):
+    NPP_Scene = img.reduceRegion(reducer=ee.Reducer.sum(), geometry=ROI_R, scale=10, maxPixels=1e13)
+    NPP_value = ee.Number(NPP_Scene.get('Band_NPP_C', 0))
+    return img.set('NPP_sum', NPP_value)
+
+NPP_Collection_Cycle_C = NPP_Collection_Result.map(Calculation_NPP_Scene_C)
+NPP_Valid_C = NPP_Collection_Cycle_C.filter(ee.Filter.notNull(['NPP_sum']))
+NPP_total_C_Collection = NPP_Valid_C.aggregate_sum('NPP_sum')
+
+NPP_Collection_Cycle_M = NPP_Collection_Result.map(Calculation_NPP_Scene_M)
+NPP_Valid_M = NPP_Collection_Cycle_M.filter(ee.Filter.notNull(['NPP_sum']))
+NPP_total_M_Collection = NPP_Valid_M.aggregate_sum('NPP_sum')
+
+NPP_Collection_Cycle_R = NPP_Collection_Result.map(Calculation_NPP_Scene_R)
+NPP_Valid_R = NPP_Collection_Cycle_R.filter(ee.Filter.notNull(['NPP_sum']))
+NPP_total_R_Collection = NPP_Valid_R.aggregate_sum('NPP_sum')
+
+#------------------------------------------------------------------------------#
+# Conversion to carbon in Mg/ha
+#------------------------------------------------------------------------------#
+
+# Total Carbon
+Carbon_Total_C_Collection = (NPP_total_C_Collection.multiply(10000)).divide(1000000)
+Carbon_Total_M_Collection = (NPP_total_M_Collection.multiply(10000)).divide(1000000)
+Carbon_Total_R_Collection = (NPP_total_R_Collection.multiply(10000)).divide(1000000)
+
+#------------------------------------------------------------------------------#
+# NPP average by treatment
+#------------------------------------------------------------------------------#
+
+NPP_Sum = NPP_Collection_Result.select('Band_NPP_C').sum()      # Adds everything by pixel across the entire Band
+Collection_T = NPP_Collection_Result.size()    			            # Collection size
+NPP_MN = NPP_Sum.divide(ee.Number(Collection_T))      		      # Take the mean according to the size of the Collection for the entire Band
+Carbon_MN = (NPP_MN.multiply(10000)).divide(1000000)
+
+# Mean carbon in treatments
+# ---------- Control ----------
+Carbon_MN_C = Carbon_MN.reduceRegion(reducer=ee.Reducer.mean(), geometry=ROI_C, scale=10, maxPixels=1e13)
+# ---------- Management ----------
+Carbon_MN_M = Carbon_MN.reduceRegion(reducer=ee.Reducer.mean(), geometry=ROI_M, scale=10, maxPixels=1e13)
+# ---------- Recovery ----------
+Carbon_MN_R = Carbon_MN.reduceRegion(reducer=ee.Reducer.mean(), geometry=ROI_R, scale=10, maxPixels=1e13)
+
+#------------------------------------------------------------------------------#
+# View results
+#------------------------------------------------------------------------------#
+
+print("Collection sizes:")
+print("NDVI_16_Collection:", NDVI_16_Collection.size().getInfo())
+print("LST_Collection:", LST_Collection.size().getInfo())
+print("SOL_Collection:", SOL_Collection.size().getInfo())
+print("We_Collection:", We_Collection.size().getInfo())
+
+# Quantity of NPP Collection
+print("Net Primary Productivity Collection:")
+print('NPP C Collection:', NPP_total_C_Collection.getInfo())
+print('NPP M Collection:', NPP_total_M_Collection.getInfo())
+print('NPP R Collection:', NPP_total_R_Collection.getInfo())
+
+# Quantity of Carbon Collection
+print("Quantity of Carbon Collection:")
+print("Carbon Total C:", Carbon_Total_C_Collection.getInfo())
+print("Carbon Total M", Carbon_Total_M_Collection.getInfo())
+print("Carbon Total R:", Carbon_Total_R_Collection.getInfo())
+
+# Average Carbon Amount
+print("Quantidade de Carbono Medio:")
+print('Carbon_Mean_C', Carbon_MN_C.getInfo())
+print('Carbon_Mean_M', Carbon_MN_M.getInfo())
+print('Carbon_Mean_R', Carbon_MN_R.getInfo())
+
+DEBUG_FLAG = True
+
+#------------------------------------------------------------------------------#
+# Export
+#------------------------------------------------------------------------------#
+
+# Exporting the average NPP and not the average carbon
+# If you want carbon, put Carbon_MM in place of NPP_MN
+
+# ---------- Control ----------
+Export_C = ee.batch.Export.image.toDrive(
+    image=NPP_MN.clip(ROI_C),
+    description='MN_For_Pixel_C',
+    folder='Export_NPP',
+    fileNamePrefix='NPP_Mean_Pixel_2018_C',
+    region=ROI_C,
+    scale=10,
+    maxPixels=1e13)
+
+# Table with average per pixel
+CSV_C = NPP_MN.sample(
+    region=ROI_C,
+    scale=10,
+    projection=NPP_MN.projection(),
+    geometries=True)
+
+Task_CSV_C = ee.batch.Export.table.toDrive(
+    collection=CSV_C,
+    description='CSV_MN_Pixel_C',
+    folder='Export_NPP',
+    fileNamePrefix='NPP_MN_CSV_2018_C',
+    fileFormat='CSV')
+
+# ---------- Management ----------
+Export_M = ee.batch.Export.image.toDrive(
+    image=NPP_MN.clip(ROI_M),
+    description='MN_For_Pixel_M',
+    folder='Export_NPP',
+    fileNamePrefix='NPP_Mean_Pixel_2018_M',
+    region=ROI_M,
+    scale=10,
+    maxPixels=1e13)
+
+# Table with average per pixel
+CSV_M = NPP_MN.sample(
+    region=ROI_M,
+    scale=10,
+    projection=NPP_MN.projection(),
+    geometries=True)
+
+Task_CSV_M = ee.batch.Export.table.toDrive(
+    collection=CSV_M,
+    description='CSV_MN_Pixel_M',
+    folder='Export_NPP',
+    fileNamePrefix='NPP_MN_CSV_2018_M',
+    fileFormat='CSV')
+
+# ---------- Recovery ----------
+Export_R = ee.batch.Export.image.toDrive(
+    image=NPP_MN.clip(ROI_R),
+    description='MN_For_Pixel_R',
+    folder='Export_NPP',
+    fileNamePrefix='NPP_Mean_Pixel_2018_R',
+    region=ROI_R,
+    scale=10,
+    maxPixels=1e13)
+
+# Table with average per pixel
+CSV_R = NPP_MN.sample(
+    region=ROI_R,
+    scale=10,
+    projection=NPP_MN.projection(),
+    geometries=True)
+
+Task_CSV_R = ee.batch.Export.table.toDrive(
+    collection=CSV_R,
+    description='CSV_MN_Pixel_R',
+    folder='Export_NPP',
+    fileNamePrefix='NPP_MN_CSV_2018_R',
+    fileFormat='CSV')
+
+# ---------- Enable exports ----------
+
+#Export_C.start()
+#Export_M.start()
+#Export_R.start()
+#Task_CSV_C.start()
+#Task_CSV_M.start()
+#Task_CSV_R .start()
