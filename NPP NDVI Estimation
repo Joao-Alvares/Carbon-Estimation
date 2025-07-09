@@ -1,0 +1,409 @@
+# Installing packages in Google Colab (only performed if necessary)
+!pip install -q geopandas geemap earthengine-api seaborn matplotlib --upgrade
+
+# Essential imports
+import geemap, ee
+import seaborn as sns
+import matplotlib.pyplot as plt
+import json
+from datetime import datetime
+import pandas as pd
+import geopandas as gpd
+
+# For interactivity
+import ipywidgets as widgets
+from IPython.display import display
+
+# Initializing Google Earth Engine
+try:
+    ee.Initialize()
+except Exception as e:
+    ee.Authenticate()
+    ee.Initialize(project='alvares-carbon-project')
+
+ROI = ee.Geometry.Polygon([[[-47.57583, -1.103708], [-47.566955, -1.10445], [-47.567404, -1.111342], [-47.56886, -1.111173],
+                            [-47.569007, -1.11221], [-47.571081, -1.111995], [-47.57096, -1.111047], [-47.576612, -1.110396]]])
+ROI_C = ee.Geometry.Polygon([[[-47.568665, -1.109994], [-47.56777, -1.110076], [-47.567867, -1.11098], [-47.568755, -1.11089]]])
+ROI_M = ee.Geometry.Polygon([[[-47.570294, -1.109887], [-47.5694, -1.109943], [-47.569503, -1.110848], [-47.570402, -1.110774]]])
+ROI_R = ee.Geometry.Polygon([[[-47.569154, -1.107642], [-47.568331, -1.108027], [-47.568726, -1.10883], [-47.569553, -1.108427]]])
+
+ROI_Buffer = ee.Geometry.Point(-47.572302, -1.1080860).buffer(3000)
+
+SCALE_M_PX = 10
+
+#------------------------------------------------------------------------------#
+# Dates for Scenes
+#------------------------------------------------------------------------------#
+
+startDate = ee.Date('2022-06-01')
+endDate = ee.Date('2022-06-30')
+
+# Month of field collection
+#------------------------------------------------------------------------------#
+# Control
+#------------------------------------------------------------------------------#
+# First "2018-08-01", "2018-08-31"
+# Second "2020-01-01", "2020-01-31"
+# Third "2022-01-01", "2022-01-31"
+
+#------------------------------------------------------------------------------#
+# Management
+#------------------------------------------------------------------------------#
+# First "2018-02-01", "2018-02-28"
+# Second "2020-01-01", "2020-01-31"
+# Third "2021-12-01", "2021-12-31"
+
+#------------------------------------------------------------------------------#
+# Recovery
+#------------------------------------------------------------------------------#
+# First "2018-04-01", "2018-04-30"
+# Second "2020-02-01", "2020-02-29"
+# Third "2022-03-01", "2022-03-31"
+
+dates = ee.List.sequence(
+    start=startDate.millis(),
+    end=endDate.millis(),
+    step=16 * 24 * 60 * 60 * 1000 
+).map(lambda millis: ee.Date(millis).format("YYYY-MM-dd"))
+
+#------------------------------------------------------------------------------#
+# Base functions
+#------------------------------------------------------------------------------#
+
+def Calculation_NDVI(image):
+    # Verificar se a imagem tem a propriedade 'system:time_start'
+    date = ee.Algorithms.If(
+        image.propertyNames().contains('system:time_start'),
+        image.date().format('yyyy-MM-dd'),
+        '2018-01-01')                             # Default date for images without 'system:time_start'
+
+    NDVI = (image.normalizedDifference(['B8', 'B4'])
+            .rename('Band_NDVI')
+            .reproject('EPSG:4326', None, SCALE_M_PX)
+            .clip(ROI_Buffer)
+            .set('date', date))
+    return NDVI
+
+# Land Surface Temperature
+def Calculation_LST(dateString):
+    Calculation_LST = (ee.ImageCollection("MODIS/061/MOD11A2")      #MODIS/061/MOD11A1          MODIS/061/MOD11A2
+        .filterBounds(ROI)
+        .filterDate(ee.Date(dateString), ee.Date(dateString).advance(16, "day"))
+        .select('LST_Day_1km')
+        .mean()                                   # Compute mean of the 2 images
+        .rename("LST")
+        .multiply(0.02)
+        .subtract(273.15)                         # Convert from Kelvin to Celsius
+        .reproject(crs='EPSG:4326', scale=SCALE_M_PX)
+        .clip(ROI_Buffer)
+        .set("date", dateString))
+
+    return Calculation_LST
+
+# Surface Solar Radiation
+def Calculation_SOL(dateString):
+    # Create an image collection filtered by region and date
+    Calculation_SOL = (ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR")
+        .filterBounds(ROI_Buffer)
+        .filterDate(ee.Date(dateString), ee.Date(dateString).advance(16, "day"))
+        .select('surface_solar_radiation_downwards_sum')
+        .sum()
+        .rename("SOL")
+        .divide(1e6)                                           # Convert J/m² to MJ/m²
+        .reproject(crs='EPSG:4326', scale=SCALE_M_PX)
+        .clip(ROI_Buffer)
+        .set("date", dateString))
+
+    return Calculation_SOL
+
+# Water Stress
+def Calculation_We(dateString):
+    imageSum16days = (ee.ImageCollection("MODIS/061/MOD16A2GF")
+        .filterDate(ee.Date(dateString), ee.Date(dateString).advance(16, "day"))
+        .filterBounds(ROI_Buffer)
+        .sum())
+
+    ET = imageSum16days.select('ET').multiply(0.1)
+    PET = imageSum16days.select('PET').multiply(0.1)
+    We = ET.divide(PET).multiply(1).add(0.5)
+
+    return (We.rename('We')
+            .reproject('EPSG:4326', None, SCALE_M_PX)
+            .clip(ROI_Buffer)
+            .set("data", dateString))
+
+#------------------------------------------------------------------------------#
+# Cloud filter
+#------------------------------------------------------------------------------#
+
+def Calculation_Cloud(image):
+    cloud_mask = image.select('QA60').bitwiseAnd(1 << 10).neq(0)
+    cloud_coverage = cloud_mask.reduceRegion(
+        reducer=ee.Reducer.mean(),
+        geometry=ROI,
+        scale=10).get("QA60")
+    return image.set("CLOUD_COVERAGE_ROI", cloud_coverage)
+
+#------------------------------------------------------------------------------#
+# Creating collections
+#------------------------------------------------------------------------------#
+
+Sentinel_Collection = (ee.ImageCollection("COPERNICUS/S2_HARMONIZED")
+                    .filterDate(startDate, endDate)
+                    .filterBounds(ROI)
+                    .map(Calculation_Cloud)
+                    .sort("CLOUD_COVERAGE_ROI"))                             # Sort by least cloud cover in ROI
+
+NDVI_Collection = (Sentinel_Collection.map(Calculation_NDVI))
+LST_Collection = ee.ImageCollection(dates.map(Calculation_LST))
+SOL_Collection = ee.ImageCollection(dates.map(Calculation_SOL))
+We_Collection = ee.ImageCollection(dates.map(Calculation_We))
+
+#------------------------------------------------------------------------------#
+# Creating the singles
+#------------------------------------------------------------------------------#
+
+NDVI_Single = ee.Image(NDVI_Collection.toList(NDVI_Collection.size()).get(0))       # Necessary to choose the scene in case of a lot of cloud
+LST_Single = LST_Collection.first()
+SOL_Single = SOL_Collection.first()
+We_Single = We_Collection.first()
+
+#------------------------------------------------------------------------------#
+# Starting the NPP
+#------------------------------------------------------------------------------#
+# Ideal temperature for plant growth
+Topt = 25
+# Maximum light usage efficiency
+LUEmax = 0.706
+
+# Function to calculate NPP
+def NPP_Single(NDVI_Single, LST_Single, SOL_Single, We_Single, Topt, LUEmax):
+
+    Calculation_1 = ee.Image().expression(
+        '0.8 + 0.02 * Topt - 0.0005 * (Topt ** 2)',
+        {'Topt': Topt})
+
+    Calculation_2 = ee.Image().expression(
+        '1 / (1 + exp(0.2 * (Topt - 10 - T))) * 1 / (1 + exp(0.3 * (-Topt - 10 + T)))',
+        {'Topt': Topt, 'T': LST_Single})
+
+    Calculation_PAR = SOL_Single.multiply(0.5)
+    Calculation_FPAR = NDVI_Single.multiply(1.2).subtract(0.14)
+    Calculation_APAR = Calculation_PAR.multiply(Calculation_FPAR)
+
+    Calculation_LUE = ee.Image().expression(
+        'LUEmax * Calculation_1 * Calculation_2 * Calculation_We',
+        {'LUEmax': LUEmax, 'Calculation_1': Calculation_1, 'Calculation_2': Calculation_2, 'Calculation_We': We_Single})
+
+    return Calculation_APAR.multiply(Calculation_LUE).rename('Band_NPP')
+
+#------------------------------------------------------------------------------#
+# NPP Single
+#------------------------------------------------------------------------------#
+NPP_Single = NPP_Single(NDVI_Single, LST_Single, SOL_Single, We_Single, Topt, LUEmax)
+
+# Converting NPP to Carbon in Megagrams
+Total_Carbon_EXP= (NPP_Single.multiply(10000)).divide(1000000)
+#------------------------------------------------------------------------------#
+# Total NPP in each area
+#------------------------------------------------------------------------------#
+
+NPP_total_C = NPP_Single.reduceRegion( reducer=ee.Reducer.sum(), geometry=ROI_C, scale=10, maxPixels=1e13)
+NPP_total_M = NPP_Single.reduceRegion( reducer=ee.Reducer.sum(), geometry=ROI_M, scale=10, maxPixels=1e13)
+NPP_total_R = NPP_Single.reduceRegion( reducer=ee.Reducer.sum(), geometry=ROI_R, scale=10, maxPixels=1e13)
+
+# Calculate total carbon
+# Square meters to hectare and then grams to megagram
+NPP_total_C_Value = ee.Number(NPP_total_C.get('Band_NPP'))
+NPP_total_M_Value = ee.Number(NPP_total_R.get('Band_NPP'))
+NPP_total_R_Value = ee.Number(NPP_total_M.get('Band_NPP'))
+
+# Conversion of gC/m² → MgC/ha
+Total_Carbon_C = (NPP_total_C_Value.multiply(10000)).divide(1000000)
+Total_Carbon_M = (NPP_total_M_Value.multiply(10000)).divide(1000000)
+Total_Carbon_R = (NPP_total_R_Value.multiply(10000)).divide(1000000)
+
+#------------------------------------------------------------------------------#
+# Extras
+#------------------------------------------------------------------------------#
+
+# NPP quantity
+print("Net Primary Productivity:")
+print('NPP C:', NPP_total_C.getInfo())
+print('NPP M:', NPP_total_M.getInfo())
+print('NPP R:', NPP_total_R.getInfo())
+
+# Carbon Amount
+print("Carbon Amount:")
+print('Total_Carbon_C:', Total_Carbon_C.getInfo())
+print('Total_Carbon_M:', Total_Carbon_M.getInfo())
+print('Total_Carbon_R:', Total_Carbon_R.getInfo())
+
+#------------------------------------------------------------------------------#
+# To Download Scenes - One At A Time
+#------------------------------------------------------------------------------#
+
+# Convert dates to strings
+start_date_str = startDate.format('YYYY-MM').getInfo()
+end_date_str = endDate.format('YYYY-MM').getInfo()
+
+# Link to download scenes
+#print("NDVI_Single:", NDVI_Single, NDVI_Single.getDownloadURL({'name': f"NDVI_Between_{start_date_str}_and_{end_date_str}", 'region': ROI_Buffer}))
+#print("NPP_Single:", NPP_Single, NPP_Single.getDownloadURL({'name': f"NPP_Between_{start_date_str}_and_{end_date_str}", 'region': ROI_Buffer}))
+#print("LST_Single:", LST_Single, LST_Single.getDownloadURL({'name': f"LST_Between_{start_date_str}_and_{end_date_str}", 'region': ROI_Buffer}))
+#print("SOL_Single:", SOL_Single, SOL_Single.getDownloadURL({'name': f"SOL_Between_{start_date_str}_and_{end_date_str}", 'region': ROI_Buffer}))
+#print("We_Single:", We_Single, We_Single.getDownloadURL({'name': f"We_Between_{start_date_str}_and_{end_date_str}", 'region': ROI_Buffer}))
+
+#------------------------------------------------------------------------------#
+# Map assembly
+#------------------------------------------------------------------------------#
+
+# ----- Scene selection with preview ----- #
+
+Map = geemap.Map()
+Map.centerObject(ROI, zoom=15)
+
+# Palettes
+NDVIvis = {'min': 0, 'max': 0.8, 'palette': ['#FF0000', '#FF00FB', '#048004']}
+NPPvis  = {'min': 20, 'max': 130, 'palette': ['darkred', 'red', 'orange', 'yellow', 'darkgreen', 'lightgreen']}
+Piavevis = {'color': '#0cebdf', 'width': 3, 'fillColor': '00000000'}
+
+# Load list of images and dates
+scene_ids = Sentinel_Collection.aggregate_array('system:id').getInfo()
+scene_dates_raw = Sentinel_Collection.aggregate_array('system:time_start').getInfo()
+
+from datetime import datetime as dt
+scene_dates = [dt.utcfromtimestamp(ts/1000).strftime('%Y-%m-%d') for ts in scene_dates_raw]
+scene_options = [(f"{i+1:02d}) {date}", scene_ids[i]) for i, date in enumerate(scene_dates)]
+
+# Widgets
+scene_selector = widgets.Dropdown(
+    options=scene_options,
+    description='Selecionar cena:',
+    style={'description_width': 'initial'},
+    layout=widgets.Layout(width='50%'))
+update_button = widgets.Button(description="Atualizar visualização", button_style='info')
+
+Topt = 25
+LUEmax = 0.706
+
+# Function for update
+def update_all(btn):
+    try:
+        while len(Map.layers) > 0:
+            Map.remove(Map.layers[-1])
+
+        # Select image and extract date
+        selected_id = scene_selector.value
+        image = ee.Image(selected_id).clip(ROI_Buffer)
+        date_obj = ee.Image(selected_id).date().format('YYYY-MM-dd').getInfo()
+
+        # NDVI
+        NDVI = (image.normalizedDifference(['B8', 'B4'])
+                .rename('NDVI')
+                .reproject('EPSG:4326', None, 10)
+                .clip(ROI_Buffer))
+
+        # LST, SOL, We
+        LST = Calculation_LST(date_obj)
+        SOL = Calculation_SOL(date_obj)
+        We = Calculation_We(date_obj)
+
+        # APAR
+        PAR = SOL.multiply(0.5)
+        FPAR = NDVI.multiply(1.2).subtract(0.14)
+        APAR = PAR.multiply(FPAR)
+
+        Calculation_1 = ee.Image().expression(
+            '0.8 + 0.02 * Topt - 0.0005 * (Topt ** 2)', {'Topt': Topt})
+
+        Calculation_2 = ee.Image().expression(
+            '1 / (1 + exp(0.2 * (Topt - 10 - T))) * 1 / (1 + exp(0.3 * (-Topt - 10 + T)))',
+            {'Topt': Topt, 'T': LST})
+
+        LUE = ee.Image().expression(
+            'LUEmax * C1 * C2 * We',
+            {'LUEmax': LUEmax, 'C1': Calculation_1, 'C2': Calculation_2, 'We': We})
+
+        NPP = APAR.multiply(LUE).rename('NPP')
+
+        # Add layers to the map
+        Map.addLayer(image, {'bands': ['B4', 'B3', 'B2'], 'min': 0, 'max': 3000, 'gamma': 1.4}, f"RGB: {date_obj}")
+        Map.addLayer(NDVI, NDVIvis, f"NDVI: {date_obj}")
+        Map.addLayer(NPP, NPPvis, f"NPP: {date_obj}")
+
+        # Add ROIs
+        Map.addLayer(ROI_C, Piavevis, 'ROI_C')
+        Map.addLayer(ROI_M, Piavevis, 'ROI_M')
+        Map.addLayer(ROI_R, Piavevis, 'ROI_R')
+        Map.addLayer(ROI, Piavevis, 'ROI')
+
+    except Exception as e:
+        print("Error updating view:", e)
+
+# Button
+update_button.on_click(update_all)
+
+# Controls and map
+display(widgets.HBox([scene_selector, update_button]))
+Map.addLayerControl()
+Map
+
+#------------------------------------------------------------------------------#
+# Exports
+#------------------------------------------------------------------------------#
+
+#------------------------------------------------------------------------------#
+# Extracting Values ​​per Pixel
+#------------------------------------------------------------------------------#
+
+# Extracts the Values ​​from the pixels
+# It has to be one by one because of the different dates - Make changes to the areas
+#Carbon_For_Pixel = Total_Carbon_EXP.sample(region=ROI_R, scale=10, projection=NPP_Single.projection(), geometries=True)
+
+# Export as a table
+#task = ee.batch.Export.table.toDrive(collection=Carbon_For_Pixel, folder='Carbon_For_Pixel', description='Carbon_For_Pixel_R_2022', fileFormat='CSV')
+#task.start()
+
+#------------------------------------------------------------------------------#
+# Scene extraction
+#------------------------------------------------------------------------------#
+
+# 2018
+# ---------- Control ----------
+#Export_C = ee.batch.Export.image.toDrive(image=NPP_Single.clip(ROI_C), description='NPP_For_Pixel_C', folder='Exports_NPP', fileNamePrefix='NPP_Total_Pixel_2018_C', region=ROI_C, scale=10)
+#Export_C.start()
+
+# ---------- Management ----------
+#Export_M = ee.batch.Export.image.toDrive(image=NPP_Single.clip(ROI_M), description='NPP_For_Pixel_M', folder='Exports_NPP', fileNamePrefix='NPP_Total_Pixel_2018_M', region=ROI_M, scale=10)
+#Export_M.start()
+
+# ---------- Recovery ----------
+#Export_R = ee.batch.Export.image.toDrive(image=NPP_Single.clip(ROI_R), description='NPP_For_Pixel_R', folder='Exports_NPP', fileNamePrefix='NPP_Total_Pixel_2018_R', region=ROI_R, scale=10)
+#Export_R.start()
+
+# 2020
+# ---------- Controle ----------
+#Export_C = ee.batch.Export.image.toDrive(image=NPP_Single.clip(ROI_C), description='NPP_For_Pixel_C', folder='Exports_NPP', fileNamePrefix='NPP_Total_Pixel_2020_C', region=ROI_C, scale=10)
+#Export_C.start()
+
+# ---------- Management ----------
+#Export_M = ee.batch.Export.image.toDrive(image=NPP_Single.clip(ROI_M), description='NPP_For_Pixel_M', folder='Exports_NPP', fileNamePrefix='NPP_Total_Pixel_2020_M', region=ROI_M, scale=10)
+#Export_M.start()
+
+# ---------- Recovery ----------
+#Export_R = ee.batch.Export.image.toDrive(image=NPP_Single.clip(ROI_R), description='NPP_For_Pixel_R', folder='Exports_NPP', fileNamePrefix='NPP_Total_Pixel_2020_R', region=ROI_R, scale=10)
+#Export_R.start()
+
+# 2022
+# ---------- Controle ----------
+#Export_C = ee.batch.Export.image.toDrive(image=NPP_Single.clip(ROI_C), description='NPP_For_Pixel_C', folder='Exports_NPP', fileNamePrefix='NPP_Total_Pixel_2022_C', region=ROI_C, scale=10)
+#Export_C.start()
+
+# ---------- Management ----------
+#Export_M = ee.batch.Export.image.toDrive(image=NPP_Single.clip(ROI_M), description='NPP_For_Pixel_M', folder='Exports_NPP', fileNamePrefix='NPP_Total_Pixel_2022_M', region=ROI_M, scale=10)
+#Export_M.start()
+
+# ---------- Recovery ----------
+#Export_R = ee.batch.Export.image.toDrive(image=NPP_Single.clip(ROI_R), description='NPP_For_Pixel_R', folder='Exports_NPP', fileNamePrefix='NPP_Total_Pixel_2022_R', region=ROI_R, scale=10)
+#Export_R.start()
